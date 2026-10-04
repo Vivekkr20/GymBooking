@@ -14,7 +14,9 @@ from datetime import datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qs, urlparse
+from zoneinfo import ZoneInfo
 
 
 ROOT = Path(__file__).parent
@@ -22,6 +24,27 @@ DB_PATH = ROOT / "gym_booking.db"
 STATIC = ROOT / "public"
 LOCK = threading.Lock()
 SECRET = os.environ.get("GYM_SECRET", "local-only-development-secret").encode()
+DATABASE_URL = os.environ.get("DATABASE_URL")
+USING_POSTGRES = bool(DATABASE_URL)
+
+if USING_POSTGRES and "GYM_SECRET" not in os.environ:
+    raise RuntimeError("Set the GYM_SECRET environment variable when DATABASE_URL is configured.")
+
+# Vercel runs in UTC. Sessions are stored as naive local timestamps, so the server
+# must use the gym's own timezone for "now". Override with GYM_TIMEZONE if needed.
+try:
+    GYM_TZ = ZoneInfo(os.environ.get("GYM_TIMEZONE", "Asia/Kolkata"))
+except Exception:
+    GYM_TZ = None
+
+INTEGRITY_ERRORS: tuple = (sqlite3.IntegrityError,)
+if USING_POSTGRES:
+    try:
+        import psycopg
+        from psycopg.rows import dict_row
+    except ImportError as error:
+        raise RuntimeError("DATABASE_URL requires the psycopg package. Install requirements.txt first.") from error
+    INTEGRITY_ERRORS = (sqlite3.IntegrityError, psycopg.IntegrityError)
 
 
 class ApiError(Exception):
@@ -30,7 +53,8 @@ class ApiError(Exception):
 
 
 def now() -> datetime:
-    return datetime.now().replace(microsecond=0)
+    current = datetime.now(GYM_TZ) if GYM_TZ else datetime.now()
+    return current.replace(microsecond=0, tzinfo=None)
 
 
 def dt(value: str) -> datetime:
@@ -41,12 +65,50 @@ def iso(value: datetime) -> str:
     return value.replace(microsecond=0).isoformat(timespec="seconds")
 
 
-def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=10, isolation_level=None)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode = WAL")
-    return conn
+class Database:
+    """Small compatibility layer so local SQLite and hosted Postgres share the API code."""
+
+    def __init__(self, connection: Any):
+        self.connection = connection
+
+    def execute(self, statement: str, params: tuple | list = ()):
+        if USING_POSTGRES:
+            statement = statement.replace("?", "%s")
+        return self.connection.execute(statement, params)
+
+    def commit(self) -> None:
+        self.connection.commit()
+
+    def rollback(self) -> None:
+        self.connection.rollback()
+
+    def close(self) -> None:
+        self.connection.close()
+
+
+def db() -> Database:
+    if USING_POSTGRES:
+        return Database(psycopg.connect(DATABASE_URL, row_factory=dict_row))
+    connection = sqlite3.connect(DB_PATH, timeout=10, isolation_level=None)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA journal_mode = WAL")
+    return Database(connection)
+
+
+def insert_id(conn: Database, statement: str, params: tuple | list) -> int:
+    if USING_POSTGRES:
+        return conn.execute(statement + " RETURNING id", params).fetchone()["id"]
+    return conn.execute(statement, params).lastrowid
+
+
+def begin_booking_transaction(conn: Database) -> None:
+    conn.execute("BEGIN" if USING_POSTGRES else "BEGIN IMMEDIATE")
+
+
+def locked_session(conn: Database, session_id: int):
+    suffix = " FOR UPDATE" if USING_POSTGRES else ""
+    return conn.execute("SELECT * FROM sessions WHERE id = ?" + suffix, (session_id,)).fetchone()
 
 
 def hash_password(password: str, salt: bytes | None = None) -> str:
@@ -73,7 +135,7 @@ def make_code() -> str:
     return "".join(secrets.choice(alphabet) for _ in range(6))
 
 
-def issue_token(conn: sqlite3.Connection, user_id: int) -> str:
+def issue_token(conn: Database, user_id: int) -> str:
     token = secrets.token_urlsafe(36)
     token_hash = hmac.new(SECRET, token.encode(), hashlib.sha256).hexdigest()
     conn.execute(
@@ -83,11 +145,11 @@ def issue_token(conn: sqlite3.Connection, user_id: int) -> str:
     return token
 
 
-def session_dict(row: sqlite3.Row, conn: sqlite3.Connection) -> dict:
+def session_dict(row, conn: Database) -> dict:
     confirmed = conn.execute(
-        "SELECT COUNT(*) FROM bookings WHERE session_id = ? AND status = 'confirmed'", (row["id"],)
-    ).fetchone()[0]
-    waitlist = conn.execute("SELECT COUNT(*) FROM waitlist WHERE session_id = ?", (row["id"],)).fetchone()[0]
+        "SELECT COUNT(*) AS count FROM bookings WHERE session_id = ? AND status = 'confirmed'", (row["id"],)
+    ).fetchone()["count"]
+    waitlist = conn.execute("SELECT COUNT(*) AS count FROM waitlist WHERE session_id = ?", (row["id"],)).fetchone()["count"]
     return {
         "id": row["id"], "startsAt": row["starts_at"], "capacity": row["capacity"],
         "confirmed": confirmed, "seatsRemaining": max(0, row["capacity"] - confirmed),
@@ -95,64 +157,79 @@ def session_dict(row: sqlite3.Row, conn: sqlite3.Connection) -> dict:
     }
 
 
-def init_db() -> None:
-    fresh = not DB_PATH.exists()
-    conn = db()
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE,
+def schema_statements() -> list[str]:
+    id_column = "BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY" if USING_POSTGRES else "INTEGER PRIMARY KEY"
+    return [
+        f"""CREATE TABLE IF NOT EXISTS users (
+            id {id_column}, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE,
             password_hash TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('member', 'admin')),
             created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS tokens (
-            id INTEGER PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, user_id INTEGER NOT NULL,
+        )""",
+        f"""CREATE TABLE IF NOT EXISTS tokens (
+            id {id_column}, token_hash TEXT NOT NULL UNIQUE, user_id BIGINT NOT NULL,
             expires_at TEXT NOT NULL, FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
-        );
-        CREATE TABLE IF NOT EXISTS sessions (
-            id INTEGER PRIMARY KEY, starts_at TEXT NOT NULL UNIQUE, capacity INTEGER NOT NULL DEFAULT 20 CHECK(capacity = 20),
-            created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS bookings (
-            id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+        )""",
+        f"""CREATE TABLE IF NOT EXISTS sessions (
+            id {id_column}, starts_at TEXT NOT NULL UNIQUE,
+            capacity INTEGER NOT NULL DEFAULT 20 CHECK(capacity = 20), created_at TEXT NOT NULL
+        )""",
+        f"""CREATE TABLE IF NOT EXISTS bookings (
+            id {id_column}, session_id BIGINT NOT NULL, user_id BIGINT NOT NULL,
             status TEXT NOT NULL CHECK(status IN ('confirmed', 'cancelled')),
             checkin_code TEXT NOT NULL UNIQUE, checked_in_at TEXT, created_at TEXT NOT NULL,
             FOREIGN KEY(session_id) REFERENCES sessions(id), FOREIGN KEY(user_id) REFERENCES users(id)
-        );
-        CREATE UNIQUE INDEX IF NOT EXISTS one_active_booking ON bookings(session_id, user_id) WHERE status = 'confirmed';
-        CREATE INDEX IF NOT EXISTS booking_session_status ON bookings(session_id, status);
-        CREATE TABLE IF NOT EXISTS waitlist (
-            id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+        )""",
+        "CREATE UNIQUE INDEX IF NOT EXISTS one_active_booking ON bookings(session_id, user_id) WHERE status = 'confirmed'",
+        "CREATE INDEX IF NOT EXISTS booking_session_status ON bookings(session_id, status)",
+        f"""CREATE TABLE IF NOT EXISTS waitlist (
+            id {id_column}, session_id BIGINT NOT NULL, user_id BIGINT NOT NULL,
             joined_at TEXT NOT NULL, FOREIGN KEY(session_id) REFERENCES sessions(id),
             FOREIGN KEY(user_id) REFERENCES users(id), UNIQUE(session_id, user_id)
-        );
-    """)
-    if fresh:
-        seed(conn)
-    conn.close()
+        )""",
+        "CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+    ]
 
 
-def seed(conn: sqlite3.Connection) -> None:
+def init_db() -> None:
+    conn = db()
+    try:
+        for statement in schema_statements():
+            conn.execute(statement)
+        user_count = conn.execute("SELECT COUNT(*) AS count FROM users").fetchone()["count"]
+        if not user_count:
+            marker = conn.execute(
+                "INSERT INTO app_meta (key, value) VALUES ('seed-v1', ?) ON CONFLICT (key) DO NOTHING",
+                (iso(now()),),
+            )
+            if marker.rowcount == 1:
+                seed(conn)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def seed(conn: Database) -> None:
     stamp = iso(now())
     people = [
         ("Pulse Admin", "admin@pulsegym.test", "admin"),
         ("Alex Morgan", "alex@pulsegym.test", "member"),
         ("Sam Rivera", "sam@pulsegym.test", "member"),
     ] + [(f"Demo Member {n:02d}", f"demo{n:02d}@pulsegym.test", "member") for n in range(1, 22)]
+    demo_hash = hash_password("MoveStrong2026!")  # hash once: 24 PBKDF2 runs would slow the first request
     for name, email, role in people:
         conn.execute(
             "INSERT INTO users (name, email, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?)",
-            (name, email, hash_password("MoveStrong2026!"), role, stamp),
+            (name, email, demo_hash, role, stamp),
         )
     base = now().replace(minute=0, second=0) + timedelta(days=1, hours=7)
     hours = [7, 12, 18, 7, 18, 12]
     ids = []
     for offset, hour in enumerate(hours):
         start = (base + timedelta(days=offset // 2)).replace(hour=hour)
-        cur = conn.execute("INSERT INTO sessions (starts_at, capacity, created_at) VALUES (?, 20, ?)", (iso(start), stamp))
-        ids.append(cur.lastrowid)
+        ids.append(insert_id(conn, "INSERT INTO sessions (starts_at, capacity, created_at) VALUES (?, 20, ?)", (iso(start), stamp)))
     # A deliberately full fixture session for waitlist behaviour.
     full_session = ids[3]
-    member_ids = [r[0] for r in conn.execute("SELECT id FROM users WHERE role = 'member' ORDER BY id LIMIT 20")]
+    member_ids = [r["id"] for r in conn.execute("SELECT id FROM users WHERE role = 'member' ORDER BY id LIMIT 20")]
     for member_id in member_ids:
         conn.execute(
             "INSERT INTO bookings (session_id, user_id, status, checkin_code, created_at) VALUES (?, ?, 'confirmed', ?, ?)",
@@ -200,7 +277,7 @@ class App(BaseHTTPRequestHandler):
         except (ValueError, UnicodeDecodeError):
             raise ApiError(400, "invalid_json", "Request body must be valid JSON.")
 
-    def user(self, conn: sqlite3.Connection, roles: tuple[str, ...] | None = None) -> sqlite3.Row:
+    def user(self, conn: Database, roles: tuple[str, ...] | None = None):
         auth = self.headers.get("Authorization", "")
         if not auth.startswith("Bearer "):
             raise ApiError(401, "unauthenticated", "Sign in to continue.")
@@ -215,7 +292,7 @@ class App(BaseHTTPRequestHandler):
             raise ApiError(403, "forbidden", "You do not have permission to do that.")
         return person
 
-    def route(self, method: str, path: str, query: dict, payload: dict, conn: sqlite3.Connection):
+    def route(self, method: str, path: str, query: dict, payload: dict, conn: Database):
         if method == "GET" and path == "/api/health":
             return 200, {"ok": True}
         if method == "POST" and path == "/api/auth/register":
@@ -227,11 +304,11 @@ class App(BaseHTTPRequestHandler):
             if len(payload["password"]) < 10: fields["password"] = "Use at least 10 characters."
             if fields: raise ApiError(422, "validation_error", "Please correct the highlighted fields.", fields)
             try:
-                cur = conn.execute("INSERT INTO users (name, email, password_hash, role, created_at) VALUES (?, ?, ?, 'member', ?)",
+                user_id = insert_id(conn, "INSERT INTO users (name, email, password_hash, role, created_at) VALUES (?, ?, ?, 'member', ?)",
                     (payload["name"].strip(), email, hash_password(payload["password"]), iso(now())))
-            except sqlite3.IntegrityError:
+            except INTEGRITY_ERRORS:
                 raise ApiError(409, "email_taken", "An account already uses that email.", {"email": "This email is already registered."})
-            person = conn.execute("SELECT * FROM users WHERE id = ?", (cur.lastrowid,)).fetchone()
+            person = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
             return 201, {"token": issue_token(conn, person["id"]), "user": self.public_user(person)}
         if method == "POST" and path == "/api/auth/login":
             require_fields(payload, ["email", "password"])
@@ -253,8 +330,8 @@ class App(BaseHTTPRequestHandler):
             sql += " ORDER BY starts_at"
             items = [session_dict(row, conn) for row in conn.execute(sql, args)]
             if person["role"] == "member":
-                booked = {r[0] for r in conn.execute("SELECT session_id FROM bookings WHERE user_id=? AND status='confirmed'", (person["id"],))}
-                waiting = {r[0] for r in conn.execute("SELECT session_id FROM waitlist WHERE user_id=?", (person["id"],))}
+                booked = {r["session_id"] for r in conn.execute("SELECT session_id FROM bookings WHERE user_id=? AND status='confirmed'", (person["id"],))}
+                waiting = {r["session_id"] for r in conn.execute("SELECT session_id FROM waitlist WHERE user_id=?", (person["id"],))}
                 for item in items:
                     item["myStatus"] = "booked" if item["id"] in booked else "waitlisted" if item["id"] in waiting else None
             return 200, {"sessions": items}
@@ -267,10 +344,10 @@ class App(BaseHTTPRequestHandler):
             except (ValueError, TypeError):
                 raise ApiError(422, "validation_error", "Sessions must start on a future hour.", {"startsAt": "Choose a future whole hour."})
             try:
-                cur = conn.execute("INSERT INTO sessions (starts_at, capacity, created_at) VALUES (?, 20, ?)", (iso(starts), iso(now())))
-            except sqlite3.IntegrityError:
+                session_id = insert_id(conn, "INSERT INTO sessions (starts_at, capacity, created_at) VALUES (?, 20, ?)", (iso(starts), iso(now())))
+            except INTEGRITY_ERRORS:
                 raise ApiError(409, "session_exists", "A session already starts at that time.", {"startsAt": "This hour is already in use."})
-            row = conn.execute("SELECT * FROM sessions WHERE id = ?", (cur.lastrowid,)).fetchone()
+            row = conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
             return 201, {"session": session_dict(row, conn)}
         if method == "GET" and path == "/api/bookings/me":
             person = self.user(conn, ("member",))
@@ -327,71 +404,71 @@ class App(BaseHTTPRequestHandler):
         raise ApiError(404, "not_found", "That route does not exist.")
 
     @staticmethod
-    def public_user(row: sqlite3.Row) -> dict:
+    def public_user(row) -> dict:
         return {"id": row["id"], "name": row["name"], "email": row["email"], "role": row["role"]}
 
     @staticmethod
-    def booking_dict(row: sqlite3.Row, conn: sqlite3.Connection, admin: bool = False) -> dict:
+    def booking_dict(row, conn: Database, admin: bool = False) -> dict:
         item = {"id": row["id"], "sessionId": row["session_id"], "startsAt": row["starts_at"], "code": row["checkin_code"], "checkedInAt": row["checked_in_at"]}
         if admin: item.update({"name": row["name"], "email": row["email"]})
         return item
 
-    def book(self, conn: sqlite3.Connection, person: sqlite3.Row, session_id: int):
+    def book(self, conn: Database, person, session_id: int):
         with LOCK:
-            conn.execute("BEGIN IMMEDIATE")
+            begin_booking_transaction(conn)
             try:
-                session = conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
+                session = locked_session(conn, session_id)
                 if not session: raise ApiError(404, "not_found", "Session not found.")
                 if dt(session["starts_at"]) <= now(): raise ApiError(409, "session_started", "This session has already started.")
                 existing = conn.execute("SELECT id FROM bookings WHERE session_id = ? AND user_id = ? AND status = 'confirmed'", (session_id, person["id"])).fetchone()
                 if existing: raise ApiError(409, "already_booked", "You already have a booking for this session.")
-                taken = conn.execute("SELECT COUNT(*) FROM bookings WHERE session_id = ? AND status = 'confirmed'", (session_id,)).fetchone()[0]
+                taken = conn.execute("SELECT COUNT(*) AS count FROM bookings WHERE session_id = ? AND status = 'confirmed'", (session_id,)).fetchone()["count"]
                 if taken >= session["capacity"]: raise ApiError(409, "session_full", "This session is full. You can join the waitlist.")
-                cur = conn.execute("INSERT INTO bookings (session_id, user_id, status, checkin_code, created_at) VALUES (?, ?, 'confirmed', ?, ?)", (session_id, person["id"], make_code(), iso(now())))
+                booking_id = insert_id(conn, "INSERT INTO bookings (session_id, user_id, status, checkin_code, created_at) VALUES (?, ?, 'confirmed', ?, ?)", (session_id, person["id"], make_code(), iso(now())))
                 conn.execute("DELETE FROM waitlist WHERE session_id = ? AND user_id = ?", (session_id, person["id"]))
-                row = conn.execute("SELECT b.*, s.starts_at FROM bookings b JOIN sessions s ON s.id=b.session_id WHERE b.id=?", (cur.lastrowid,)).fetchone()
+                row = conn.execute("SELECT b.*, s.starts_at FROM bookings b JOIN sessions s ON s.id=b.session_id WHERE b.id=?", (booking_id,)).fetchone()
                 conn.commit()
                 return 201, {"booking": self.booking_dict(row, conn)}
             except Exception:
                 conn.rollback(); raise
 
-    def waitlist(self, conn: sqlite3.Connection, person: sqlite3.Row, session_id: int, method: str):
+    def waitlist(self, conn: Database, person, session_id: int, method: str):
         if method == "DELETE":
             cur = conn.execute("DELETE FROM waitlist WHERE session_id = ? AND user_id = ?", (session_id, person["id"]))
             if not cur.rowcount: raise ApiError(404, "not_found", "You are not on this waitlist.")
             return 200, {"message": "You left the waitlist."}
         if method != "POST": raise ApiError(404, "not_found", "That route does not exist.")
         with LOCK:
-            conn.execute("BEGIN IMMEDIATE")
+            begin_booking_transaction(conn)
             try:
-                session = conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
+                session = locked_session(conn, session_id)
                 if not session: raise ApiError(404, "not_found", "Session not found.")
                 if dt(session["starts_at"]) <= now(): raise ApiError(409, "session_started", "This session has already started.")
-                taken = conn.execute("SELECT COUNT(*) FROM bookings WHERE session_id = ? AND status = 'confirmed'", (session_id,)).fetchone()[0]
+                taken = conn.execute("SELECT COUNT(*) AS count FROM bookings WHERE session_id = ? AND status = 'confirmed'", (session_id,)).fetchone()["count"]
                 if taken < session["capacity"]: raise ApiError(409, "seats_available", "A seat is available - book it instead.")
                 try: conn.execute("INSERT INTO waitlist (session_id, user_id, joined_at) VALUES (?, ?, ?)", (session_id, person["id"], iso(now())))
-                except sqlite3.IntegrityError: raise ApiError(409, "already_waitlisted", "You are already on the waitlist.")
+                except INTEGRITY_ERRORS: raise ApiError(409, "already_waitlisted", "You are already on the waitlist.")
                 conn.commit(); return 201, {"message": "You are on the waitlist."}
             except Exception:
                 conn.rollback(); raise
 
-    def cancel(self, conn: sqlite3.Connection, person: sqlite3.Row, booking_id: int):
+    def cancel(self, conn: Database, person, booking_id: int):
         with LOCK:
-            conn.execute("BEGIN IMMEDIATE")
+            begin_booking_transaction(conn)
             try:
                 booking = conn.execute("""
                   SELECT b.*, s.starts_at, s.capacity FROM bookings b JOIN sessions s ON s.id=b.session_id
                   WHERE b.id=? AND b.user_id=? AND b.status='confirmed'
                 """, (booking_id, person["id"])).fetchone()
                 if not booking: raise ApiError(404, "not_found", "Booking not found.")
+                locked_session(conn, booking["session_id"])
                 if dt(booking["starts_at"]) <= now(): raise ApiError(409, "session_started", "Bookings cannot be cancelled after a session starts.")
                 conn.execute("UPDATE bookings SET status='cancelled' WHERE id=?", (booking_id,))
                 next_member = conn.execute("SELECT * FROM waitlist WHERE session_id=? ORDER BY joined_at, id LIMIT 1", (booking["session_id"],)).fetchone()
                 promoted = None
                 if next_member and dt(booking["starts_at"]) > now():
-                    cur = conn.execute("INSERT INTO bookings (session_id, user_id, status, checkin_code, created_at) VALUES (?, ?, 'confirmed', ?, ?)", (booking["session_id"], next_member["user_id"], make_code(), iso(now())))
+                    promoted = insert_id(conn, "INSERT INTO bookings (session_id, user_id, status, checkin_code, created_at) VALUES (?, ?, 'confirmed', ?, ?)", (booking["session_id"], next_member["user_id"], make_code(), iso(now())))
                     conn.execute("DELETE FROM waitlist WHERE id=?", (next_member["id"],))
-                    promoted = cur.lastrowid
                 conn.commit(); return 200, {"message": "Your booking was cancelled.", "promotedBookingId": promoted}
             except Exception:
                 conn.rollback(); raise
